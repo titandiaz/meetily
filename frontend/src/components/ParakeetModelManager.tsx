@@ -37,11 +37,13 @@ export function ParakeetModelManager({
   // Refs for stable callbacks
   const onModelSelectRef = useRef(onModelSelect);
   const autoSaveRef = useRef(autoSave);
+  const selectedModelRef = useRef(selectedModel);
 
   useEffect(() => {
     onModelSelectRef.current = onModelSelect;
     autoSaveRef.current = autoSave;
-  }, [onModelSelect, autoSave]);
+    selectedModelRef.current = selectedModel;
+  }, [onModelSelect, autoSave, selectedModel]);
 
   // Progress throttle map to prevent rapid updates
   const progressThrottleRef = useRef<Map<string, { progress: number; timestamp: number }>>(new Map());
@@ -174,8 +176,11 @@ export function ParakeetModelManager({
               duration: 4000
             });
 
-            // Auto-select after download using stable refs
-            if (onModelSelectRef.current) {
+            // Auto-select after download only when this provider already drives live
+            // transcription: downloading a model to reprocess meetings with must not
+            // silently switch the real-time model (selectedModel is undefined when
+            // another provider is live).
+            if (onModelSelectRef.current && selectedModelRef.current) {
               onModelSelectRef.current(modelName);
               if (autoSaveRef.current) {
                 saveModelSelection(modelName);

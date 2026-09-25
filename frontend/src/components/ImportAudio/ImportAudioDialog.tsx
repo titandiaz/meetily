@@ -37,6 +37,7 @@ import { useRouter } from 'next/navigation';
 import { useSidebar } from '../Sidebar/SidebarProvider';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { saveReprocessingModelKey } from '@/lib/reprocessingModel';
 
 
 interface ImportAudioDialogProps {
@@ -92,7 +93,14 @@ export function ImportAudioDialog({
     loadingModels,
     fetchModels,
     resetSelection,
-  } = useTranscriptionModels(transcriptModelConfig);
+  } = useTranscriptionModels(transcriptModelConfig, { preferReprocessingModel: true });
+
+  // Remember the choice as the reprocessing model (never touches the live model)
+  const rememberReprocessingModel = (key: string) => {
+    if (!key) return;
+    saveReprocessingModelKey(key).catch(error =>
+      console.error('Failed to save reprocessing model preference:', error));
+  };
 
   const handleImportComplete = useCallback((result: ImportResult) => {
     toast.success(`Import complete! ${result.segments_count} segments created.`);
@@ -187,6 +195,7 @@ export function ImportAudioDialog({
   const handleStartImport = async () => {
     if (!fileInfo) return;
 
+    rememberReprocessingModel(selectedModelKey);
     await startImport(
       fileInfo.path,
       title || fileInfo.filename,

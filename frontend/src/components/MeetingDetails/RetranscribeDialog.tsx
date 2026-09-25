@@ -22,6 +22,7 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { saveReprocessingModelKey } from '@/lib/reprocessingModel';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -72,7 +73,14 @@ export function RetranscribeDialog({
     loadingModels,
     fetchModels,
     resetSelection,
-  } = useTranscriptionModels(transcriptModelConfig);
+  } = useTranscriptionModels(transcriptModelConfig, { preferReprocessingModel: true });
+
+  // Remember the choice as the reprocessing model (never touches the live model)
+  const rememberReprocessingModel = (key: string) => {
+    if (!key) return;
+    saveReprocessingModelKey(key).catch(error =>
+      console.error('Failed to save reprocessing model preference:', error));
+  };
 
   // Stable refs for callbacks to avoid listener re-registration
   const onCompleteRef = useRef(onComplete);
@@ -205,6 +213,7 @@ export function RetranscribeDialog({
     setIsProcessing(true);
     setError(null);
     setProgress(null);
+    rememberReprocessingModel(selectedModelKey);
 
     try {
       const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;

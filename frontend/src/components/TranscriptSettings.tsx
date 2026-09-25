@@ -7,6 +7,7 @@ import { Label } from './ui/label';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { ReprocessingModelSetting } from './ReprocessingModelSetting';
 
 
 export interface TranscriptModelProps {
@@ -104,7 +105,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 <div className="space-y-4 pb-6">
                     <div>
                         <Label className="block text-sm font-medium text-gray-700 mb-1">
-                            Transcript Model
+                            Live Transcription Model
                         </Label>
                         <div className="flex space-x-2 mx-1">
                             <Select
@@ -172,6 +173,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         </div>
                     )}
 
+                    {(uiProvider === 'localWhisper' || uiProvider === 'parakeet') && (
+                        <div className="mt-6 pt-6 border-t border-gray-200">
+                            <ReprocessingModelSetting />
+                        </div>
+                    )}
 
                     {requiresApiKey && (
                         <div>

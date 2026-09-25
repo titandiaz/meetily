@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { loadReprocessingModelKey } from '@/lib/reprocessingModel';
 
 export interface RawModelInfo {
   name: string;
@@ -26,9 +27,15 @@ interface TranscriptModelConfig {
  * in ImportAudioDialog and RetranscribeDialog components.
  *
  * @param transcriptModelConfig - User's saved model configuration from context
+ * @param options.preferReprocessingModel - Default to the reprocessing model preference
+ *   (batch work like retranscription/import) before falling back to the live model
  * @returns Object containing available models, selected model key, loading state, and fetch function
  */
-export function useTranscriptionModels(transcriptModelConfig: TranscriptModelConfig | undefined) {
+export function useTranscriptionModels(
+  transcriptModelConfig: TranscriptModelConfig | undefined,
+  options: { preferReprocessingModel?: boolean } = {},
+) {
+  const { preferReprocessingModel = false } = options;
   const [availableModels, setAvailableModels] = useState<ModelOption[]>([]);
   const [selectedModelKey, setSelectedModelKey] = useState<string>('');
   const [loadingModels, setLoadingModels] = useState(false);
@@ -79,6 +86,11 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     setAvailableModels(allModels);
 
+    const reprocessingKey = preferReprocessingModel ? await loadReprocessingModelKey() : null;
+    const reprocessingMatch = reprocessingKey
+      ? allModels.find((m) => `${m.provider}:${m.name}` === reprocessingKey)
+      : undefined;
+
     // Set default model based on user's saved configuration
     const configuredProvider = transcriptModelConfig?.provider || '';
     const configuredModel = transcriptModelConfig?.model || '';
@@ -93,7 +105,10 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     // Only set default model if user hasn't manually selected one
     if (!userSelectedRef.current) {
-      if (configuredMatch) {
+      if (reprocessingMatch) {
+        // Batch work: the dedicated reprocessing model wins over the live one
+        setSelectedModelKey(`${reprocessingMatch.provider}:${reprocessingMatch.name}`);
+      } else if (configuredMatch) {
         // Use the configured model if available
         setSelectedModelKey(`${configuredMatch.provider}:${configuredMatch.name}`);
       } else if (allModels.length > 0) {
@@ -103,7 +118,7 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
     }
 
     setLoadingModels(false);
-  }, [transcriptModelConfig]);
+  }, [transcriptModelConfig, preferReprocessingModel]);
 
   // Reset user selection tracking (call when dialog opens fresh)
   const resetSelection = useCallback(() => {
