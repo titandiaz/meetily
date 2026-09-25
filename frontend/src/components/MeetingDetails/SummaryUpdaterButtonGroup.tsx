@@ -2,7 +2,7 @@
 
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, Save, Loader2 } from 'lucide-react';
+import { Copy, Save, Loader2, NotebookPen } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 
 interface SummaryUpdaterButtonGroupProps {
@@ -10,6 +10,7 @@ interface SummaryUpdaterButtonGroupProps {
   isDirty: boolean;
   onSave: () => Promise<void>;
   onCopy: () => Promise<void>;
+  onExportToObsidian?: () => Promise<void>;
 }
 
 export function SummaryUpdaterButtonGroup({
@@ -17,6 +18,7 @@ export function SummaryUpdaterButtonGroup({
   isDirty,
   onSave,
   onCopy,
+  onExportToObsidian,
 }: SummaryUpdaterButtonGroupProps) {
   return (
     <ButtonGroup>
@@ -59,6 +61,23 @@ export function SummaryUpdaterButtonGroup({
         <Copy />
         <span className="hidden @[40rem]:inline">Copy</span>
       </Button>
+
+      {/* Export to Obsidian button */}
+      {onExportToObsidian && (
+        <Button
+          variant="outline"
+          size="sm"
+          title="Export summary and transcript to Obsidian"
+          onClick={() => {
+            Analytics.trackButtonClick('export_obsidian', 'meeting_details_summary');
+            onExportToObsidian();
+          }}
+          className="cursor-pointer"
+        >
+          <NotebookPen />
+          <span className="hidden @[40rem]:inline">Obsidian</span>
+        </Button>
+      )}
 
     </ButtonGroup>
   );

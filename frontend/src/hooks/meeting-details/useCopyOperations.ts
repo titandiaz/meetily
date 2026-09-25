@@ -5,6 +5,13 @@ import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { invoke as invokeTauri } from '@tauri-apps/api/core';
 import { hasVisibleSummaryContent } from '@/lib/summary-content';
+import {
+  buildObsidianNote,
+  chooseObsidianVault,
+  formatTranscriptTime,
+  loadObsidianSettings,
+  openInObsidian,
+} from '@/lib/obsidian';
 
 interface UseCopyOperationsProps {
   meeting: any;
@@ -72,22 +79,10 @@ export function useCopyOperations({
 
     console.log(`✅ Copying ${allTranscripts.length} transcripts to clipboard`);
 
-    // Format timestamps as recording-relative [MM:SS] instead of wall-clock time
-    const formatTime = (seconds: number | undefined, fallbackTimestamp: string): string => {
-      if (seconds === undefined) {
-        // For old transcripts without audio_start_time, use wall-clock time
-        return fallbackTimestamp;
-      }
-      const totalSecs = Math.floor(seconds);
-      const mins = Math.floor(totalSecs / 60);
-      const secs = totalSecs % 60;
-      return `[${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
-    };
-
     const header = `# Transcript of the Meeting: ${meeting.id} - ${meetingTitle ?? meeting.title}\n\n`;
     const date = `## Date: ${new Date(meeting.created_at).toLocaleDateString()}\n\n`;
     const fullTranscript = allTranscripts
-      .map(t => `${formatTime(t.audio_start_time, t.timestamp)} ${t.text}  `)
+      .map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.text}  `)
       .join('\n');
 
     await navigator.clipboard.writeText(header + date + fullTranscript);
@@ -105,6 +100,53 @@ export function useCopyOperations({
     });
   }, [meeting, meetingTitle, fetchAllTranscripts]);
 
+  // Summary as markdown: BlockNote editor first, then stored markdown, then legacy sections
+  const resolveSummaryMarkdown = useCallback(async (): Promise<string> => {
+    let summaryMarkdown = '';
+
+    console.log('🔍 Resolving summary markdown...');
+
+    // Try to get markdown from BlockNote editor first
+    if (blockNoteSummaryRef.current?.getMarkdown) {
+      console.log('📝 Trying to get markdown from ref...');
+      summaryMarkdown = await blockNoteSummaryRef.current.getMarkdown();
+      console.log('📝 Got markdown from ref, length:', summaryMarkdown.length);
+    }
+
+    // Fallback: Check if aiSummary has markdown property
+    if (!summaryMarkdown && aiSummary && typeof aiSummary.markdown === 'string') {
+      console.log('📝 Using markdown from aiSummary');
+      summaryMarkdown = aiSummary.markdown;
+      console.log('📝 Markdown from aiSummary, length:', summaryMarkdown.length);
+    }
+
+    // Fallback: Check for legacy format
+    if (!summaryMarkdown && aiSummary) {
+      console.log('📝 Converting legacy format to markdown');
+      const sections = Object.entries(aiSummary)
+        .filter(([key]) => {
+          // Skip non-section keys
+          return key !== 'markdown' && key !== 'summary_json' && key !== '_section_order' && key !== 'MeetingName';
+        })
+        .map(([, section]) => {
+          if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
+            const sectionTitle = `## ${section.title}\n\n`;
+            const sectionContent = section.blocks
+              .map((block: any) => `- ${block.content}`)
+              .join('\n');
+            return sectionTitle + sectionContent;
+          }
+          return '';
+        })
+        .filter(s => s.trim())
+        .join('\n\n');
+      summaryMarkdown = sections;
+      console.log('📝 Converted legacy format, length:', summaryMarkdown.length);
+    }
+
+    return summaryMarkdown;
+  }, [aiSummary, blockNoteSummaryRef]);
+
   // Copy summary to clipboard
   const handleCopySummary = useCallback(async () => {
     if (!hasVisibleSummaryContent(aiSummary)) {
@@ -112,47 +154,7 @@ export function useCopyOperations({
       return;
     }
     try {
-      let summaryMarkdown = '';
-
-      console.log('🔍 Copy Summary - Starting...');
-
-      // Try to get markdown from BlockNote editor first
-      if (blockNoteSummaryRef.current?.getMarkdown) {
-        console.log('📝 Trying to get markdown from ref...');
-        summaryMarkdown = await blockNoteSummaryRef.current.getMarkdown();
-        console.log('📝 Got markdown from ref, length:', summaryMarkdown.length);
-      }
-
-      // Fallback: Check if aiSummary has markdown property
-      if (!summaryMarkdown && aiSummary && typeof aiSummary.markdown === 'string') {
-        console.log('📝 Using markdown from aiSummary');
-        summaryMarkdown = aiSummary.markdown;
-        console.log('📝 Markdown from aiSummary, length:', summaryMarkdown.length);
-      }
-
-      // Fallback: Check for legacy format
-      if (!summaryMarkdown && aiSummary) {
-        console.log('📝 Converting legacy format to markdown');
-        const sections = Object.entries(aiSummary)
-          .filter(([key]) => {
-            // Skip non-section keys
-            return key !== 'markdown' && key !== 'summary_json' && key !== '_section_order' && key !== 'MeetingName';
-          })
-          .map(([, section]) => {
-            if (section && typeof section === 'object' && 'title' in section && 'blocks' in section) {
-              const sectionTitle = `## ${section.title}\n\n`;
-              const sectionContent = section.blocks
-                .map((block: any) => `- ${block.content}`)
-                .join('\n');
-              return sectionTitle + sectionContent;
-            }
-            return '';
-          })
-          .filter(s => s.trim())
-          .join('\n\n');
-        summaryMarkdown = sections;
-        console.log('📝 Converted legacy format, length:', summaryMarkdown.length);
-      }
+      const summaryMarkdown = await resolveSummaryMarkdown();
 
       // If still no summary content, show message
       if (!summaryMarkdown.trim()) {
@@ -192,10 +194,60 @@ export function useCopyOperations({
       console.error('❌ Failed to copy summary:', error);
       toast.error("Failed to copy summary");
     }
-  }, [aiSummary, meetingTitle, meeting, blockNoteSummaryRef]);
+  }, [aiSummary, meetingTitle, meeting, resolveSummaryMarkdown]);
+
+  // Export summary + transcript as a single note into the Obsidian vault
+  const handleExportToObsidian = useCallback(async () => {
+    try {
+      let { vaultPath, folder } = await loadObsidianSettings();
+      if (!vaultPath) {
+        vaultPath = await chooseObsidianVault();
+        if (!vaultPath) return;
+      }
+
+      const allTranscripts = await fetchAllTranscripts(meeting.id);
+      const summaryMarkdown = hasVisibleSummaryContent(aiSummary) ? await resolveSummaryMarkdown() : '';
+      if (!allTranscripts.length && !summaryMarkdown.trim()) {
+        toast.error('Nothing to export yet — no summary or transcript');
+        return;
+      }
+
+      const { fileName, content } = buildObsidianNote({
+        meetingId: meeting.id,
+        title: meetingTitle || meeting.title || 'Meeting',
+        createdAt: new Date(meeting.created_at),
+        summaryMarkdown,
+        transcriptLines: allTranscripts.map(t => `${formatTranscriptTime(t.audio_start_time, t.timestamp)} ${t.text}`),
+      });
+
+      const notePath = await invokeTauri<string>('obsidian_export_note', {
+        vaultPath,
+        folder,
+        fileName,
+        meetingId: meeting.id,
+        content,
+      });
+
+      toast.success('Exported to Obsidian', {
+        description: `${folder}/${notePath.split(/[\\/]/).pop()}`,
+        action: { label: 'Open', onClick: () => void openInObsidian(notePath) },
+      });
+      await Analytics.track('export_obsidian', {
+        meeting_id: meeting.id,
+        has_summary: (!!summaryMarkdown.trim()).toString(),
+        transcript_length: allTranscripts.length.toString(),
+      });
+    } catch (error) {
+      console.error('❌ Failed to export to Obsidian:', error);
+      toast.error('Failed to export to Obsidian', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [meeting, meetingTitle, aiSummary, fetchAllTranscripts, resolveSummaryMarkdown]);
 
   return {
     handleCopyTranscript,
     handleCopySummary,
+    handleExportToObsidian,
   };
 }

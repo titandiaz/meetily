@@ -44,6 +44,7 @@ pub mod database;
 #[cfg(target_os = "macos")]
 pub mod meeting_detector;
 pub mod notifications;
+pub mod obsidian;
 pub mod ollama;
 pub mod onboarding;
 pub mod openai;
@@ -756,6 +757,10 @@ pub fn run() {
             api::test_backend_connection,
             api::debug_backend_connection,
             api::open_external_url,
+            // Obsidian export
+            obsidian::obsidian_detect_vaults,
+            obsidian::obsidian_select_vault,
+            obsidian::obsidian_export_note,
             // Custom OpenAI commands
             api::api_save_custom_openai_config,
             api::api_get_custom_openai_config,

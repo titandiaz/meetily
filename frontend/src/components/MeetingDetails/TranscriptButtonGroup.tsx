@@ -3,7 +3,7 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, NotebookPen, RefreshCw } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -12,6 +12,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 interface TranscriptButtonGroupProps {
   transcriptCount: number;
   onCopyTranscript: () => void;
+  onExportToObsidian?: () => Promise<void>;
   onOpenMeetingFolder: () => Promise<void>;
   meetingId?: string;
   meetingFolderPath?: string | null;
@@ -22,6 +23,7 @@ interface TranscriptButtonGroupProps {
 export function TranscriptButtonGroup({
   transcriptCount,
   onCopyTranscript,
+  onExportToObsidian,
   onOpenMeetingFolder,
   meetingId,
   meetingFolderPath,
@@ -54,6 +56,23 @@ export function TranscriptButtonGroup({
           <Copy />
           <span className="hidden @[22rem]:inline">Copy</span>
         </Button>
+
+        {onExportToObsidian && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="px-2 @[22rem]:px-3"
+            onClick={() => {
+              Analytics.trackButtonClick('export_obsidian', 'meeting_details_transcript');
+              onExportToObsidian();
+            }}
+            disabled={transcriptCount === 0}
+            title={transcriptCount === 0 ? 'No transcript available' : 'Export summary and transcript to Obsidian'}
+          >
+            <NotebookPen />
+            <span className="hidden @[22rem]:inline">Obsidian</span>
+          </Button>
+        )}
 
         <Button
           size="sm"

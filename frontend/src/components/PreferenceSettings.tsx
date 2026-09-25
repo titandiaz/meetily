@@ -6,6 +6,7 @@ import { FolderOpen } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
 import Analytics from "@/lib/analytics"
 import AnalyticsConsentSwitch from "./AnalyticsConsentSwitch"
+import { ObsidianSettings } from "./ObsidianSettings"
 import { useConfig, NotificationSettings } from "@/contexts/ConfigContext"
 
 export function PreferenceSettings() {
@@ -193,6 +194,9 @@ export function PreferenceSettings() {
           <Switch checked={meetingDetectionEnabled} onCheckedChange={handleMeetingDetectionChange} />
         </div>
       </div>
+
+      {/* Obsidian Export Section */}
+      <ObsidianSettings />
 
       {/* Data Storage Locations Section */}
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
