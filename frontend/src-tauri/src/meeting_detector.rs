@@ -9,8 +9,11 @@
 //! The detector is gated by the `meeting_detection_enabled` notification
 //! preference and stays quiet while a recording is already in progress.
 
+use std::collections::HashSet;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use futures_util::FutureExt;
 
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder, Wry};
 
@@ -18,6 +21,19 @@ use crate::notifications::commands::NotificationManagerState;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 const SLACK_BUNDLE_ID: &str = "com.tinyspeck.slackmacgap";
+/// A mic start right after a Meet alert belongs to that same meeting
+/// (e.g. clicking "Join" after the lobby was detected), so don't alert twice.
+const MEET_REJOIN_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Bundle ids of the browsers in `BROWSERS`, used to tell whether a mic start
+/// comes from a Meet tab (browser frontmost) rather than another app.
+const BROWSER_BUNDLE_IDS: &[&str] = &[
+    "com.google.Chrome",
+    "com.brave.Browser",
+    "com.microsoft.edgemac",
+    "company.thebrowser.Browser",
+    "com.apple.Safari",
+];
 
 /// Browsers that expose tab URLs through the same AppleScript interface.
 const BROWSERS: &[&str] = &[
@@ -30,8 +46,13 @@ const BROWSERS: &[&str] = &[
 
 #[derive(Default)]
 struct DetectorState {
-    /// Meet code already notified about; resets when the tab disappears
-    notified_meet_code: Option<String>,
+    /// Meet codes already handled whose tabs are still open. Each code is
+    /// dropped once its tab closes, so reopening the link alerts again.
+    known_meet_codes: HashSet<String>,
+    /// When the last Meet alert fired (see MEET_REJOIN_COOLDOWN)
+    last_meet_alert: Option<Instant>,
+    /// Whether the previous poll saw a recording in progress
+    was_recording: bool,
     /// Whether the mic was in use on the previous poll (edge detection)
     mic_was_active: bool,
     /// Already notified during the current mic-active session
@@ -57,12 +78,43 @@ pub fn start(app: AppHandle<Wry>) {
             });
         }
 
+        #[cfg(target_os = "macos")]
+        disable_app_nap();
+
         let mut state = DetectorState::default();
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            poll_once(&app, &mut state).await;
+            // A panic inside one poll must not end the task: the detector
+            // would silently stop until the app restarts.
+            let poll = std::panic::AssertUnwindSafe(poll_once(&app, &mut state));
+            if poll.catch_unwind().await.is_err() {
+                log::error!("Meeting detector: poll panicked, resetting state and continuing");
+                state = DetectorState::default();
+            }
         }
     });
+}
+
+/// Opt this process out of App Nap for its whole lifetime. While the window
+/// stays hidden for hours, App Nap throttles timers, so the 3 s poll can fall
+/// behind by minutes and meetings go unnoticed.
+#[cfg(target_os = "macos")]
+fn disable_app_nap() {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+
+    // NSActivityUserInitiatedAllowingIdleSystemSleep: keeps timers running
+    // without preventing the Mac from sleeping when idle.
+    const OPTIONS: u64 = 0x00FF_FFFF & !(1u64 << 20);
+    unsafe {
+        let info: *mut Object = msg_send![class!(NSProcessInfo), processInfo];
+        let reason: *mut Object = msg_send![class!(NSString),
+            stringWithUTF8String: b"Detecting meetings to offer recording\0".as_ptr()];
+        let activity: *mut Object = msg_send![info, beginActivityWithOptions: OPTIONS reason: reason];
+        // Held for the app's lifetime; the activity ends when the process exits.
+        let _: *mut Object = msg_send![activity, retain];
+    }
+    log::info!("Meeting detector: App Nap disabled");
 }
 
 async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
@@ -74,28 +126,45 @@ async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
     // recording produces so stopping doesn't immediately re-trigger Slack detection.
     if crate::audio::recording_commands::is_recording().await {
         state.mic_was_active = true;
+        state.was_recording = true;
         return;
     }
 
-    // Google Meet: notify once per open meeting tab
-    match find_meet_code(app).await {
-        Some(code) => {
-            if state.notified_meet_code.as_deref() != Some(code.as_str()) {
-                state.notified_meet_code = Some(code.clone());
-                notify_meeting(
-                    app,
-                    "Google Meet detected",
-                    &format!("A Meet tab ({}) is open. Start recording?", code),
-                );
-            }
-        }
-        None => state.notified_meet_code = None,
-    }
+    // Google Meet: look at every Meet tab, not just the first one. Tabs of
+    // meetings already left keep their URL, so checking only one let an old
+    // tab hide a new meeting for the rest of the day.
+    let meet_codes = find_meet_codes(app).await;
+    state.known_meet_codes.retain(|code| meet_codes.contains(code));
+    let new_code = meet_codes
+        .iter()
+        .find(|code| !state.known_meet_codes.contains(*code))
+        .cloned();
+    state.known_meet_codes.extend(meet_codes.iter().cloned());
 
-    // Slack huddle: mic just became active while Slack is frontmost
+    // Tabs already open when a recording ends belong to that meeting.
+    let just_stopped_recording = std::mem::take(&mut state.was_recording);
+
     let mic_active = mic_in_use();
-    if mic_active && !state.mic_was_active && !state.notified_this_mic_session {
-        if frontmost_bundle_id().as_deref() == Some(SLACK_BUNDLE_ID) {
+    let mic_started = mic_active && !state.mic_was_active && !state.notified_this_mic_session;
+
+    if let (Some(code), false) = (&new_code, just_stopped_recording) {
+        notify_meet(app, state, code, mic_active);
+    } else if mic_started {
+        let frontmost = frontmost_bundle_id();
+        let meet_cooldown_over = state
+            .last_meet_alert
+            .map_or(true, |at| at.elapsed() >= MEET_REJOIN_COOLDOWN);
+
+        if let (Some(code), Some(true), true) = (
+            meet_codes.first(),
+            frontmost.as_deref().map(|id| BROWSER_BUNDLE_IDS.contains(&id)),
+            meet_cooldown_over,
+        ) {
+            // Rejoining a meeting whose tab stayed open (same link, e.g. a
+            // daily standup): the tab isn't new, but the mic just started.
+            notify_meet(app, state, code, true);
+        } else if frontmost.as_deref() == Some(SLACK_BUNDLE_ID) {
+            // Slack huddle: mic just became active while Slack is frontmost
             state.notified_this_mic_session = true;
             notify_meeting(
                 app,
@@ -108,6 +177,18 @@ async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
         state.notified_this_mic_session = false;
     }
     state.mic_was_active = mic_active;
+}
+
+fn notify_meet(app: &AppHandle<Wry>, state: &mut DetectorState, code: &str, mic_active: bool) {
+    state.last_meet_alert = Some(Instant::now());
+    if mic_active {
+        state.notified_this_mic_session = true;
+    }
+    notify_meeting(
+        app,
+        "Google Meet detected",
+        &format!("A Meet tab ({}) is open. Start recording?", code),
+    );
 }
 
 async fn detection_enabled(app: &AppHandle<Wry>) -> bool {
@@ -131,17 +212,21 @@ async fn detection_enabled(app: &AppHandle<Wry>) -> bool {
 // Google Meet detection (browser tabs via AppleScript)
 // ---------------------------------------------------------------------------
 
-async fn find_meet_code(app: &AppHandle<Wry>) -> Option<String> {
+/// Meet codes of every open Meet tab across all running browsers, in tab order.
+async fn find_meet_codes(app: &AppHandle<Wry>) -> Vec<String> {
+    let mut codes = Vec::new();
     for browser in BROWSERS {
         // Never `tell` a browser that isn't running: AppleScript would launch it.
         if !app_running(browser) {
             continue;
         }
-        if let Some(code) = query_browser_tabs(app, browser).await {
-            return Some(code);
+        for code in query_browser_tabs(app, browser).await {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
         }
     }
-    None
+    codes
 }
 
 fn app_running(process_name: &str) -> bool {
@@ -152,7 +237,7 @@ fn app_running(process_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn query_browser_tabs(app: &AppHandle<Wry>, browser: &str) -> Option<String> {
+async fn query_browser_tabs(app: &AppHandle<Wry>, browser: &str) -> Vec<String> {
     let script = format!(
         r#"set urlList to {{}}
 tell application "{browser}"
@@ -179,9 +264,10 @@ return urlList as text"#
             .kill_on_drop(true)
             .output(),
     )
-    .await
-    .ok()?
-    .ok()?;
+    .await;
+    let Ok(Ok(output)) = output else {
+        return Vec::new();
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,10 +290,10 @@ return urlList as text"#
                 stderr
             );
         }
-        return None;
+        return Vec::new();
     }
 
-    extract_meet_code(&String::from_utf8_lossy(&output.stdout))
+    extract_meet_codes(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Emit a one-time (per app run) event so the frontend can tell the user how
@@ -224,8 +310,9 @@ fn notify_permission_denied_once(app: &AppHandle<Wry>, browser: &str) {
     );
 }
 
-/// Extract a Meet meeting code (`xxx-xxxx-xxx`) from a block of URLs.
-fn extract_meet_code(text: &str) -> Option<String> {
+/// Extract every Meet meeting code (`xxx-xxxx-xxx`) from a block of URLs.
+fn extract_meet_codes(text: &str) -> Vec<String> {
+    let mut codes = Vec::new();
     for chunk in text.split(|c: char| c.is_whitespace() || c == ',') {
         let Some(idx) = chunk.find("meet.google.com/") else {
             continue;
@@ -240,11 +327,12 @@ fn extract_meet_code(text: &str) -> Option<String> {
             && parts
                 .iter()
                 .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric()))
+            && !codes.contains(&code)
         {
-            return Some(code);
+            codes.push(code);
         }
     }
-    None
+    codes
 }
 
 // ---------------------------------------------------------------------------
@@ -466,18 +554,24 @@ pub async fn handle_alert_action(app: AppHandle<Wry>, action: String) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::extract_meet_code;
+    use super::extract_meet_codes;
 
     #[test]
     fn extracts_meet_code_from_urls() {
         let text = "https://mail.google.com/mail/u/0\nhttps://meet.google.com/abc-defg-hij?authuser=0\n";
-        assert_eq!(extract_meet_code(text), Some("abc-defg-hij".to_string()));
+        assert_eq!(extract_meet_codes(text), vec!["abc-defg-hij".to_string()]);
+    }
+
+    #[test]
+    fn extracts_every_meet_tab_once() {
+        let text = "https://meet.google.com/old-code-aaa\nhttps://meet.google.com/new-code-bbb\nhttps://meet.google.com/old-code-aaa";
+        assert_eq!(extract_meet_codes(text), vec!["old-code-aaa".to_string(), "new-code-bbb".to_string()]);
     }
 
     #[test]
     fn ignores_non_meeting_meet_urls() {
-        assert_eq!(extract_meet_code("https://meet.google.com/landing"), None);
-        assert_eq!(extract_meet_code("https://meet.google.com/"), None);
-        assert_eq!(extract_meet_code("https://example.com/"), None);
+        assert!(extract_meet_codes("https://meet.google.com/landing").is_empty());
+        assert!(extract_meet_codes("https://meet.google.com/").is_empty());
+        assert!(extract_meet_codes("https://example.com/").is_empty());
     }
 }
