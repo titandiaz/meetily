@@ -266,6 +266,20 @@ export class RecordingService {
       callback(event.payload);
     });
   }
+
+  /**
+   * Listen for meeting-detection-permission-error event (macOS denied the
+   * Automation permission the Meet-tab detector relies on)
+   * @param callback - Function to call with the affected browser name
+   * @returns Promise that resolves to unlisten function
+   */
+  async onMeetingDetectionPermissionError(
+    callback: (payload: { browser: string }) => void
+  ): Promise<UnlistenFn> {
+    return listen<{ browser: string }>('meeting-detection-permission-error', (event) => {
+      callback(event.payload);
+    });
+  }
 }
 
 // Export singleton instance

@@ -241,6 +241,17 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         });
         unsubscribers.push(unlistenMeetingDetected);
 
+        // Meet-tab detection lost its Automation permission (happens after
+        // reinstalling: ad-hoc signatures change and macOS drops the grant)
+        const unlistenDetectionPermission = await recordingService.onMeetingDetectionPermissionError(({ browser }) => {
+          console.warn('[RecordingStateContext] Meeting detection permission denied for', browser);
+          toast.warning('Meeting detection needs permission', {
+            description: `Allow Meetily to control ${browser} in System Settings → Privacy & Security → Automation, then restart the app to detect Google Meet tabs.`,
+            duration: 20000,
+          });
+        });
+        unsubscribers.push(unlistenDetectionPermission);
+
         console.log('[RecordingStateContext] Event listeners set up successfully');
       } catch (error) {
         console.error('[RecordingStateContext] Failed to set up event listeners:', error);

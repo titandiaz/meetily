@@ -78,7 +78,7 @@ async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
     }
 
     // Google Meet: notify once per open meeting tab
-    match find_meet_code().await {
+    match find_meet_code(app).await {
         Some(code) => {
             if state.notified_meet_code.as_deref() != Some(code.as_str()) {
                 state.notified_meet_code = Some(code.clone());
@@ -131,13 +131,13 @@ async fn detection_enabled(app: &AppHandle<Wry>) -> bool {
 // Google Meet detection (browser tabs via AppleScript)
 // ---------------------------------------------------------------------------
 
-async fn find_meet_code() -> Option<String> {
+async fn find_meet_code(app: &AppHandle<Wry>) -> Option<String> {
     for browser in BROWSERS {
         // Never `tell` a browser that isn't running: AppleScript would launch it.
         if !app_running(browser) {
             continue;
         }
-        if let Some(code) = query_browser_tabs(browser).await {
+        if let Some(code) = query_browser_tabs(app, browser).await {
             return Some(code);
         }
     }
@@ -152,7 +152,7 @@ fn app_running(process_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn query_browser_tabs(browser: &str) -> Option<String> {
+async fn query_browser_tabs(app: &AppHandle<Wry>, browser: &str) -> Option<String> {
     let script = format!(
         r#"set urlList to {{}}
 tell application "{browser}"
@@ -166,8 +166,12 @@ set AppleScript's text item delimiters to linefeed
 return urlList as text"#
     );
 
+    // Generous timeout: on the first run after (re)install macOS shows the
+    // Automation consent dialog and osascript blocks until the user answers.
+    // A short timeout would kill osascript under the user's cursor and the
+    // request would be recorded as denied.
     let output = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(45),
         tokio::process::Command::new("osascript")
             .args(["-e", &script])
             // Without this, a timed-out osascript (e.g. waiting on the
@@ -180,16 +184,44 @@ return urlList as text"#
     .ok()?;
 
     if !output.status.success() {
-        // Most likely the Automation permission was denied for this browser
-        log::debug!(
-            "Meeting detector: could not read {} tabs: {}",
-            browser,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        // -1743 = errAEEventNotPermitted: the Automation permission for this
+        // browser is denied (it silently stops carrying over when the app
+        // binary is replaced, since ad-hoc signatures change every build).
+        // Detection would die silently otherwise, so tell the user once.
+        if stderr.contains("-1743") || stderr.contains("Not authorized") {
+            log::warn!(
+                "Meeting detector: Automation permission denied for {}: {}",
+                browser,
+                stderr
+            );
+            notify_permission_denied_once(app, browser);
+        } else {
+            log::debug!(
+                "Meeting detector: could not read {} tabs: {}",
+                browser,
+                stderr
+            );
+        }
         return None;
     }
 
     extract_meet_code(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Emit a one-time (per app run) event so the frontend can tell the user how
+/// to restore the Automation permission that Meet-tab detection depends on.
+fn notify_permission_denied_once(app: &AppHandle<Wry>, browser: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static NOTIFIED: AtomicBool = AtomicBool::new(false);
+    if NOTIFIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit(
+        "meeting-detection-permission-error",
+        serde_json::json!({ "browser": browser }),
+    );
 }
 
 /// Extract a Meet meeting code (`xxx-xxxx-xxx`) from a block of URLs.
