@@ -345,9 +345,12 @@ fn show_alert_overlay(app: &AppHandle<Wry>, title: &str, body: &str) {
 
     // Window creation must happen on the main thread on macOS
     let result = app.clone().run_on_main_thread(move || {
-        // Replace any previous overlay so the new one picks up fresh params
+        // Replace any previous overlay so the new one picks up fresh params.
+        // destroy() (not close()) — close() only requests teardown, so the
+        // label would still be taken when the builder runs right below and
+        // the new overlay would silently fail to appear.
         if let Some(existing) = app.get_webview_window(ALERT_WINDOW_LABEL) {
-            let _ = existing.close();
+            let _ = existing.destroy();
         }
 
         // Top-center of the primary screen

@@ -1,7 +1,9 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useRouter } from 'next/navigation';
 import { recordingService } from '@/services/recordingService';
+import { triggerRecordingStart } from '@/lib/startRecordingTrigger';
 import { toast } from 'sonner';
 
 /**
@@ -59,6 +61,7 @@ export const useRecordingState = () => {
 };
 
 export function RecordingStateProvider({ children }: { children: React.ReactNode }) {
+  const router = useRouter();
   const [state, setState] = useState<RecordingState>({
     isRecording: false,
     isPaused: false,
@@ -231,7 +234,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
             action: {
               label: 'Start recording',
               onClick: () => {
-                window.dispatchEvent(new CustomEvent('start-recording-from-sidebar'));
+                triggerRecordingStart((path) => router.push(path));
               },
             },
           });

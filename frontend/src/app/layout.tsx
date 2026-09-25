@@ -9,8 +9,10 @@ import AnalyticsProvider from '@/components/AnalyticsProvider'
 import { Toaster, toast } from 'sonner'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
+import { triggerRecordingStart } from '@/lib/startRecordingTrigger'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { RecordingStateProvider } from '@/contexts/RecordingStateContext'
 import { OllamaDownloadProvider } from '@/contexts/OllamaDownloadContext'
@@ -68,6 +70,7 @@ export default function RootLayout({
 }: {
   children: React.ReactNode
 }) {
+  const router = useRouter()
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
 
@@ -116,16 +119,17 @@ export default function RootLayout({
           description: "You need to finish onboarding before you can start recording."
         });
       } else {
-        // If in main app, forward to useRecordingStart via window event
-        console.log('[Layout] Forwarding to start-recording-from-sidebar');
-        window.dispatchEvent(new CustomEvent('start-recording-from-sidebar'));
+        // Starts directly when on the home page, otherwise navigates home
+        // with the auto-start flag (the home listener doesn't exist elsewhere)
+        console.log('[Layout] Forwarding to recording start trigger');
+        triggerRecordingStart((path) => router.push(path));
       }
     });
 
     return () => {
       unlisten.then(fn => fn());
     };
-  }, [showOnboarding]);
+  }, [showOnboarding, router]);
 
   // Handle file drop for audio import
   const handleFileDrop = useCallback((paths: string[]) => {

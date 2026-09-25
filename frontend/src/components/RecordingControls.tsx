@@ -114,6 +114,13 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
       // Parse error message to provide user-friendly feedback
       const errorMsg = error instanceof Error ? error.message : String(error);
 
+      // A start raced with one already in flight (meeting-detection toast,
+      // overlay, tray): recording is running, so there is nothing to report.
+      if (errorMsg.includes('already in progress')) {
+        console.log('Recording already in progress — skipping error dialog');
+        return;
+      }
+
       // Check for device-related errors
       if (errorMsg.includes('microphone') || errorMsg.includes('mic') || errorMsg.includes('input')) {
         setDeviceError({
