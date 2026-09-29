@@ -111,25 +111,30 @@ export function PreferenceSettings() {
     handleUpdateNotificationSettings();
   }, [notificationsEnabled, notificationSettings, isInitialLoad, previousNotificationsEnabled, updateNotificationSettings])
 
-  // Meeting detection toggle (Google Meet tabs / Slack huddles)
+  // Meeting detection toggles (Google Meet tabs / Slack huddles, auto-stop)
   const meetingDetectionEnabled =
     notificationSettings?.notification_preferences.meeting_detection_enabled ?? true;
+  const autoStopOnCallEnd =
+    notificationSettings?.notification_preferences.auto_stop_on_call_end ?? true;
 
-  const handleMeetingDetectionChange = async (checked: boolean) => {
+  const updateMeetingPreference = async (
+    key: 'meeting_detection_enabled' | 'auto_stop_on_call_end',
+    checked: boolean
+  ) => {
     if (!notificationSettings) return;
     try {
       await updateNotificationSettings({
         ...notificationSettings,
         notification_preferences: {
           ...notificationSettings.notification_preferences,
-          meeting_detection_enabled: checked,
+          [key]: checked,
         },
       });
       await Analytics.track('notification_settings_changed', {
-        meeting_detection_enabled: checked.toString()
+        [key]: checked.toString()
       });
     } catch (error) {
-      console.error('Failed to update meeting detection setting:', error);
+      console.error(`Failed to update ${key}:`, error);
     }
   };
 
@@ -191,7 +196,22 @@ export function PreferenceSettings() {
               Get notified when a Google Meet tab or a Slack huddle is detected, with a shortcut to start recording (macOS)
             </p>
           </div>
-          <Switch checked={meetingDetectionEnabled} onCheckedChange={handleMeetingDetectionChange} />
+          <Switch
+            checked={meetingDetectionEnabled}
+            onCheckedChange={(checked) => updateMeetingPreference('meeting_detection_enabled', checked)}
+          />
+        </div>
+        <div className="flex items-center justify-between mt-6 pt-6 border-t border-gray-200">
+          <div>
+            <h4 className="font-medium text-gray-900 mb-1">Stop recording when the call ends</h4>
+            <p className="text-sm text-gray-600">
+              When the call app (browser, Slack, Zoom…) stops using the microphone for 30 seconds, you get 30 seconds to keep recording before it stops automatically (macOS 14+)
+            </p>
+          </div>
+          <Switch
+            checked={autoStopOnCallEnd}
+            onCheckedChange={(checked) => updateMeetingPreference('auto_stop_on_call_end', checked)}
+          />
         </div>
       </div>
 

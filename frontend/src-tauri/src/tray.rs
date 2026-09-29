@@ -149,7 +149,9 @@ fn resume_recording_handler<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
-fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
+/// Full stop flow (backend stop + frontend post-processing via
+/// `recording-stop-complete`), shared with the meeting detector's auto-stop.
+pub(crate) fn stop_recording_handler<R: Runtime>(app: &AppHandle<R>) {
     // Immediately show stopping state
     set_tray_state(app, RecordingState::Stopping);
 

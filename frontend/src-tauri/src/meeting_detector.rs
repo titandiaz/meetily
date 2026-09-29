@@ -8,9 +8,16 @@
 //!
 //! The detector is gated by the `meeting_detection_enabled` notification
 //! preference and stays quiet while a recording is already in progress.
+//!
+//! While recording it also watches for the end of the call (gated by
+//! `auto_stop_on_call_end`): once another app (browser, Slack, Zoom…) has been
+//! seen capturing the microphone, the call is considered over when no other
+//! process has captured it for `CALL_END_GRACE`. The overlay then offers to keep
+//! recording and otherwise stops the recording after `AUTO_STOP_COUNTDOWN`.
 
 use std::collections::HashSet;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
@@ -24,6 +31,14 @@ const SLACK_BUNDLE_ID: &str = "com.tinyspeck.slackmacgap";
 /// A mic start right after a Meet alert belongs to that same meeting
 /// (e.g. clicking "Join" after the lobby was detected), so don't alert twice.
 const MEET_REJOIN_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// No other app has used the mic for this long: the call has probably ended.
+const CALL_END_GRACE: Duration = Duration::from_secs(30);
+/// Time the "call ended" overlay gives the user to keep the recording going.
+const AUTO_STOP_COUNTDOWN: Duration = Duration::from_secs(30);
+
+/// Set by the overlay's "Keep recording" button, consumed by the poll loop.
+static KEEP_RECORDING_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Bundle ids of the browsers in `BROWSERS`, used to tell whether a mic start
 /// comes from a Meet tab (browser frontmost) rather than another app.
@@ -57,6 +72,18 @@ struct DetectorState {
     mic_was_active: bool,
     /// Already notified during the current mic-active session
     notified_this_mic_session: bool,
+    /// Call-end tracking for the recording in progress
+    call: CallTracker,
+}
+
+#[derive(Default)]
+struct CallTracker {
+    /// Another app has captured the mic during this recording
+    armed: bool,
+    /// Since when no other app has captured the mic
+    quiet_since: Option<Instant>,
+    /// Pending auto-stop (overlay shown)
+    stop_at: Option<Instant>,
 }
 
 /// Spawn the background detection loop. Call once during app setup.
@@ -118,15 +145,28 @@ fn disable_app_nap() {
 }
 
 async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
-    if !detection_enabled(app).await {
-        return;
-    }
+    let (detection_enabled, auto_stop_enabled) = detector_preferences(app).await;
 
     // Don't nag while already recording; also swallow the mic edge our own
     // recording produces so stopping doesn't immediately re-trigger Slack detection.
     if crate::audio::recording_commands::is_recording().await {
         state.mic_was_active = true;
         state.was_recording = true;
+        if auto_stop_enabled {
+            track_call_end(app, &mut state.call);
+        } else if state.call.stop_at.is_some() {
+            cancel_auto_stop(app, &mut state.call);
+        }
+        return;
+    }
+    if state.call.stop_at.is_some() {
+        // Stopped by other means while the overlay was up
+        close_alert_overlay(app);
+    }
+    state.call = CallTracker::default();
+    KEEP_RECORDING_REQUESTED.store(false, Ordering::SeqCst);
+
+    if !detection_enabled {
         return;
     }
 
@@ -179,6 +219,78 @@ async fn poll_once(app: &AppHandle<Wry>, state: &mut DetectorState) {
     state.mic_was_active = mic_active;
 }
 
+// ---------------------------------------------------------------------------
+// Auto-stop when the call ends
+// ---------------------------------------------------------------------------
+
+fn track_call_end(app: &AppHandle<Wry>, call: &mut CallTracker) {
+    // No per-process data (macOS < 14): can't tell the call apart from our
+    // own mic capture, so never auto-stop.
+    let Some(others) = other_processes_capturing_mic() else {
+        return;
+    };
+
+    if KEEP_RECORDING_REQUESTED.swap(false, Ordering::SeqCst) {
+        log::info!("Auto-stop: user chose to keep recording; disarmed until the mic is used again");
+        *call = CallTracker::default();
+        close_alert_overlay(app);
+        return;
+    }
+
+    if !others.is_empty() {
+        if !call.armed {
+            log::info!("Auto-stop: call detected (processes capturing mic: {:?})", others);
+        }
+        call.armed = true;
+        call.quiet_since = None;
+        if call.stop_at.is_some() {
+            log::info!("Auto-stop: mic in use again, cancelling");
+            cancel_auto_stop(app, call);
+        }
+        return;
+    }
+
+    if !call.armed {
+        // Recording without a call app (in-person meeting, voice memo…)
+        return;
+    }
+
+    let quiet_since = *call.quiet_since.get_or_insert_with(Instant::now);
+    match call.stop_at {
+        None if quiet_since.elapsed() >= CALL_END_GRACE => {
+            log::info!("Auto-stop: no other app has used the mic for {:?}, asking before stopping", CALL_END_GRACE);
+            call.stop_at = Some(Instant::now() + AUTO_STOP_COUNTDOWN);
+            show_call_ended_overlay(app);
+        }
+        Some(stop_at) if Instant::now() >= stop_at => {
+            log::info!("Auto-stop: call ended, stopping the recording");
+            *call = CallTracker::default();
+            close_alert_overlay(app);
+            crate::tray::stop_recording_handler(app);
+        }
+        _ => {}
+    }
+}
+
+fn cancel_auto_stop(app: &AppHandle<Wry>, call: &mut CallTracker) {
+    call.stop_at = None;
+    call.quiet_since = None;
+    close_alert_overlay(app);
+}
+
+fn show_call_ended_overlay(app: &AppHandle<Wry>) {
+    let seconds = AUTO_STOP_COUNTDOWN.as_secs();
+    show_alert_overlay(
+        app,
+        &format!(
+            "meeting-alert.html?mode=callEnded&seconds={}&title={}&body={}",
+            seconds,
+            percent_encode("Call ended"),
+            percent_encode(&format!("Recording will stop in {} s", seconds)),
+        ),
+    );
+}
+
 fn notify_meet(app: &AppHandle<Wry>, state: &mut DetectorState, code: &str, mic_active: bool) {
     state.last_meet_alert = Some(Instant::now());
     if mic_active {
@@ -191,20 +303,18 @@ fn notify_meet(app: &AppHandle<Wry>, state: &mut DetectorState, code: &str, mic_
     );
 }
 
-async fn detection_enabled(app: &AppHandle<Wry>) -> bool {
+/// (meeting detection enabled, auto-stop on call end enabled)
+async fn detector_preferences(app: &AppHandle<Wry>) -> (bool, bool) {
     let Some(manager_state) = app.try_state::<NotificationManagerState<Wry>>() else {
-        return false;
+        return (false, false);
     };
     let lock = manager_state.read().await;
     match lock.as_ref() {
         Some(manager) => {
-            manager
-                .get_settings()
-                .await
-                .notification_preferences
-                .meeting_detection_enabled
+            let prefs = manager.get_settings().await.notification_preferences;
+            (prefs.meeting_detection_enabled, prefs.auto_stop_on_call_end)
         }
-        None => false,
+        None => (false, false),
     }
 }
 
@@ -356,12 +466,80 @@ extern "C" {
         io_data_size: *mut u32,
         out_data: *mut std::ffi::c_void,
     ) -> i32;
+
+    fn AudioObjectGetPropertyDataSize(
+        in_object_id: u32,
+        in_address: *const AudioObjectPropertyAddress,
+        in_qualifier_data_size: u32,
+        in_qualifier_data: *const std::ffi::c_void,
+        out_data_size: *mut u32,
+    ) -> i32;
 }
 
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
 const K_DEFAULT_INPUT_DEVICE: u32 = u32::from_be_bytes(*b"dIn ");
 const K_DEVICE_IS_RUNNING_SOMEWHERE: u32 = u32::from_be_bytes(*b"gone");
 const K_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+// Per-process audio objects (macOS 14+)
+const K_PROCESS_OBJECT_LIST: u32 = u32::from_be_bytes(*b"prs#");
+const K_PROCESS_PID: u32 = u32::from_be_bytes(*b"ppid");
+const K_PROCESS_IS_RUNNING_INPUT: u32 = u32::from_be_bytes(*b"piri");
+
+/// PIDs of processes other than ours that are capturing audio input.
+/// `None` when the per-process API is unavailable (macOS < 14).
+fn other_processes_capturing_mic() -> Option<Vec<i32>> {
+    fn read_u32(object: u32, selector: u32) -> Option<u32> {
+        let addr = AudioObjectPropertyAddress {
+            m_selector: selector,
+            m_scope: K_SCOPE_GLOBAL,
+            m_element: 0,
+        };
+        let mut value: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+        let status = unsafe {
+            AudioObjectGetPropertyData(object, &addr, 0, std::ptr::null(), &mut size, &mut value as *mut u32 as *mut _)
+        };
+        (status == 0).then_some(value)
+    }
+
+    let addr = AudioObjectPropertyAddress {
+        m_selector: K_PROCESS_OBJECT_LIST,
+        m_scope: K_SCOPE_GLOBAL,
+        m_element: 0,
+    };
+    let mut size: u32 = 0;
+    let status = unsafe {
+        AudioObjectGetPropertyDataSize(K_AUDIO_OBJECT_SYSTEM_OBJECT, &addr, 0, std::ptr::null(), &mut size)
+    };
+    if status != 0 {
+        return None;
+    }
+    let mut objects = vec![0u32; size as usize / std::mem::size_of::<u32>()];
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            K_AUDIO_OBJECT_SYSTEM_OBJECT,
+            &addr,
+            0,
+            std::ptr::null(),
+            &mut size,
+            objects.as_mut_ptr() as *mut _,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    objects.truncate(size as usize / std::mem::size_of::<u32>());
+
+    let own_pid = std::process::id() as i32;
+    Some(
+        objects
+            .into_iter()
+            .filter(|&object| read_u32(object, K_PROCESS_IS_RUNNING_INPUT).unwrap_or(0) != 0)
+            .filter_map(|object| read_u32(object, K_PROCESS_PID).map(|pid| pid as i32))
+            .filter(|&pid| pid != own_pid)
+            .collect(),
+    )
+}
 
 /// Whether the default input device is being used by any process.
 fn mic_in_use() -> bool {
@@ -448,20 +626,29 @@ fn notify_meeting(app: &AppHandle<Wry>, title: &str, body: &str) {
 
     // Floating overlay window: not a system notification, so Focus/Do Not
     // Disturb and per-app notification settings can't suppress it.
-    show_alert_overlay(app, title, body);
+    show_alert_overlay(
+        app,
+        &format!(
+            "meeting-alert.html?title={}&body={}",
+            percent_encode(title),
+            percent_encode(body)
+        ),
+    );
 }
 
 const ALERT_WINDOW_LABEL: &str = "meeting-alert";
 const ALERT_WIDTH: f64 = 480.0;
 const ALERT_HEIGHT: f64 = 88.0;
 
-fn show_alert_overlay(app: &AppHandle<Wry>, title: &str, body: &str) {
+fn close_alert_overlay(app: &AppHandle<Wry>) {
+    if let Some(overlay) = app.get_webview_window(ALERT_WINDOW_LABEL) {
+        let _ = overlay.close();
+    }
+}
+
+fn show_alert_overlay(app: &AppHandle<Wry>, url: &str) {
     let app = app.clone();
-    let url = format!(
-        "meeting-alert.html?title={}&body={}",
-        percent_encode(title),
-        percent_encode(body)
-    );
+    let url = url.to_string();
 
     // Window creation must happen on the main thread on macOS
     let result = app.clone().run_on_main_thread(move || {
@@ -530,12 +717,22 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-/// Handle a button press from the overlay window ("start" or "dismiss").
+/// Handle a button press from the overlay window: "start"/"dismiss" for a
+/// detected meeting, "stop_now"/"keep_recording" for a call that ended.
 pub async fn handle_alert_action(app: AppHandle<Wry>, action: String) -> Result<(), String> {
     log::info!("Meeting alert action: {}", action);
 
-    if let Some(overlay) = app.get_webview_window(ALERT_WINDOW_LABEL) {
-        let _ = overlay.close();
+    close_alert_overlay(&app);
+
+    if action == "keep_recording" {
+        KEEP_RECORDING_REQUESTED.store(true, Ordering::SeqCst);
+        return Ok(());
+    }
+    if action == "stop_now" {
+        if crate::audio::recording_commands::is_recording().await {
+            crate::tray::stop_recording_handler(&app);
+        }
+        return Ok(());
     }
 
     if action == "start" {
@@ -566,6 +763,14 @@ mod tests {
     fn extracts_every_meet_tab_once() {
         let text = "https://meet.google.com/old-code-aaa\nhttps://meet.google.com/new-code-bbb\nhttps://meet.google.com/old-code-aaa";
         assert_eq!(extract_meet_codes(text), vec!["old-code-aaa".to_string(), "new-code-bbb".to_string()]);
+    }
+
+    #[test]
+    fn per_process_mic_query_excludes_own_process() {
+        // Available on macOS 14+ (the only target the auto-stop supports)
+        let pids = super::other_processes_capturing_mic()
+            .expect("per-process CoreAudio API unavailable");
+        assert!(!pids.contains(&(std::process::id() as i32)));
     }
 
     #[test]

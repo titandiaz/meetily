@@ -40,6 +40,7 @@ export interface NotificationSettings {
     show_system_errors: boolean;
     meeting_reminder_minutes: number[];
     meeting_detection_enabled: boolean;
+    auto_stop_on_call_end: boolean;
   };
 }
 
