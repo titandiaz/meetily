@@ -234,9 +234,10 @@ fn resolve_mic_or_default<R: Runtime>(
 
 /// macOS: a Bluetooth microphone forces the headset into HFP (8-16 kHz telephone
 /// mode), which degrades playback and breaks the 48 kHz mixing pipeline. Replace
-/// it with the built-in mic and emit `device-override-warning` so the UI can tell
-/// the user. System audio is left untouched: ScreenCaptureKit taps the digital
-/// stream before Bluetooth encoding, so it stays clean.
+/// it with the built-in mic, or another wired mic (USB/webcam) on Macs without
+/// one, and emit `device-override-warning` so the UI can tell the user. System
+/// audio is left untouched: ScreenCaptureKit taps the digital stream before
+/// Bluetooth encoding, so it stays clean.
 #[cfg(target_os = "macos")]
 fn override_bluetooth_mic<R: Runtime>(
     app: &AppHandle<R>,
@@ -248,22 +249,22 @@ fn override_bluetooth_mic<R: Runtime>(
                 .is_bluetooth() =>
         {
             warn!("🎧 Bluetooth microphone '{}' requested for recording", device.name);
-            match super::devices::find_builtin_input_device() {
-                Ok(Some(builtin)) => {
+            match super::devices::find_wired_input_device() {
+                Ok(Some(wired)) => {
                     let msg = format!(
                         "'{}' records at telephone quality over Bluetooth. Recording with '{}' instead — you can keep listening through your headphones.",
-                        device.name, builtin.name
+                        device.name, wired.name
                     );
-                    warn!("→ ✅ Overriding to built-in microphone: {}", msg);
+                    warn!("→ ✅ Overriding to wired microphone: {}", msg);
                     let _ = app.emit("device-override-warning", msg);
-                    Some(Arc::new(builtin))
+                    Some(Arc::new(wired))
                 }
                 _ => {
                     let msg = format!(
                         "Recording with Bluetooth microphone '{}': audio quality will be degraded (telephone bandwidth).",
                         device.name
                     );
-                    warn!("→ ⚠️ No built-in microphone found. {}", msg);
+                    warn!("→ ⚠️ No wired microphone found. {}", msg);
                     let _ = app.emit("device-override-warning", msg);
                     Some(device)
                 }

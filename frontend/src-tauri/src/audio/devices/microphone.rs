@@ -65,3 +65,39 @@ pub fn find_builtin_input_device() -> Result<Option<AudioDevice>> {
     warn!("⚠️ No built-in microphone found (searched {} patterns)", builtin_patterns.len());
     Ok(None)
 }
+
+/// Find a non-Bluetooth microphone to record from instead of a Bluetooth one:
+/// the built-in mic when there is one, otherwise any other physical wired
+/// input (USB mic, webcam…). Desktop Macs such as the Mac mini have no
+/// built-in mic, so without the second step a Bluetooth headset could never
+/// be replaced there.
+///
+/// Returns None if only Bluetooth or virtual inputs are available.
+pub fn find_wired_input_device() -> Result<Option<AudioDevice>> {
+    if let Some(builtin) = find_builtin_input_device()? {
+        return Ok(Some(builtin));
+    }
+
+    // Loopback/virtual inputs carry no microphone signal (and device detection
+    // classifies some of them as wired), so they are never a replacement.
+    const VIRTUAL_PATTERNS: &[&str] = &[
+        "blackhole", "vb-audio", "virtual", "loopback", "monitor", "aggregate",
+        "soundflower", "zoomaudio", "zoom audio", "teams audio", "loom",
+    ];
+
+    let host = cpal::default_host();
+    for device in host.input_devices()? {
+        let Ok(name) = device.name() else { continue };
+        let name_lower = name.to_lowercase();
+        if VIRTUAL_PATTERNS.iter().any(|p| name_lower.contains(p)) {
+            continue;
+        }
+        if crate::audio::device_detection::InputDeviceKind::detect(&name, 0, 0).is_wired() {
+            info!("🎤 Found wired microphone: '{}'", name);
+            return Ok(Some(AudioDevice::new(name, DeviceType::Input)));
+        }
+    }
+
+    warn!("⚠️ No wired (non-Bluetooth, non-virtual) microphone found");
+    Ok(None)
+}
